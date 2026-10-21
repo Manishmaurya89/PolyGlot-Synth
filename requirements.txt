@@ -1,0 +1,21 @@
+# PolyGlot-Crew runtime dependencies (Python >= 3.11)
+# Tested with the versions noted on the right.
+
+# Orchestration
+langgraph>=1.0,<2            # tested 1.2.16
+langchain-core>=1.0,<2       # tested 1.6.12
+
+# LLM providers (switch with LLM_PROVIDER / <ROLE>_LLM in .env)
+langchain-anthropic>=1.0,<2  # tested 1.7.6
+langchain-ollama>=1.0,<2     # tested 1.1.0
+
+# Schemas, config, data
+pydantic>=2.7,<3             # tested 2.14.1
+python-dotenv>=1.0           # tested 1.2.4
+pandas>=2.2                  # tested 3.0.6
+
+# Publishing
+huggingface_hub>=0.30        # tested 2.2.0
+
+# Development
+pytest>=8                    # tested 9.1.1
