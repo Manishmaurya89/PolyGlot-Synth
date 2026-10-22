@@ -1,18 +1,6 @@
-"""Agent node implementations.
+"""The graph nodes: architect, localizer, evaluator, and the export/quarantine sinks.
 
-``AgentNodes`` bundles the LangGraph node callables. Its LLM dependencies are
-injected as :class:`~src.llm.StructuredGenerator` objects, so nodes are
-provider-agnostic and unit-testable with scripted fakes.
-
-Nodes:
-
-* :meth:`AgentNodes.domain_architect` - seed topic -> sub-topics + English context.
-* :meth:`AgentNodes.localization_adapter` - transcreates one sub-topic into one
-  language and aligns entity spans deterministically.
-* :meth:`AgentNodes.adversarial_evaluator` - rule-based gates, then an LLM
-  critic; produces ``quality_score`` and feedback for the retry loop.
-* :meth:`AgentNodes.export_sample` / :meth:`AgentNodes.quarantine_sample` -
-  terminal sinks of the per-sample loop.
+The LLMs are passed in, so the tests can swap in scripted fakes.
 """
 
 from __future__ import annotations
@@ -31,7 +19,7 @@ from src.agents.state import (
     SampleTask,
 )
 from src.config import QualityGate
-from src.linguistics import align_entities, extract_numbers, nfc, script_ratio
+from src.linguistics import align_entities, contains_term, extract_numbers, nfc, script_ratio
 from src.llm import StructuredGenerator
 from src.schemas.agent_io import (
     CriticVerdict,
@@ -61,12 +49,8 @@ class PipelineError(RuntimeError):
 
 
 def aggregate_quality(breakdown: QualityBreakdown, gate: QualityGate) -> float:
-    """Combine rubric dimensions into a single ``quality_score``.
-
-    Weighted mean of the critic's dimensions, capped at the weakest dimension
-    whenever that dimension is below ``gate.dimension_floor``. The cap makes the
-    score non-compensatory: excellent fluency cannot rescue a hallucinated dose.
-    """
+    """Weighted mean of the critic's scores, capped at the weakest one when it
+    falls below the floor. Without the cap, great fluency could hide a wrong dose."""
     dims = {name: float(getattr(breakdown, name)) for name in gate.weights}
     total_weight = sum(gate.weights.values())
     score = sum(dims[name] * weight for name, weight in gate.weights.items()) / total_weight
@@ -81,8 +65,6 @@ def _format_key_entities(subtopic: SubTopic) -> str:
 
 
 class AgentNodes:
-    """LangGraph node callables with injected LLM dependencies."""
-
     def __init__(
         self,
         *,
@@ -96,15 +78,10 @@ class AgentNodes:
         self._evaluator = evaluator
         self._quality = quality
 
-    # ------------------------------------------------------------------ #
-    # Domain Architect
-    # ------------------------------------------------------------------ #
-
     def domain_architect(self, state: PipelineState) -> dict[str, Any]:
-        """Expand the seed topic into grounded sub-topics.
+        """Split the seed topic into sub-topics, each with an English passage.
 
-        Raises:
-            PipelineError: if no usable sub-topic survives sanitisation.
+        Raises PipelineError if none of them survive the clean-up.
         """
         domain = Domain(state["domain"])
         requested = state["num_subtopics"]
@@ -147,12 +124,15 @@ class AgentNodes:
             context = sub.domain_context.strip()
             if not title_key or title_key in seen_titles or not context:
                 continue
-            context_cf = context.casefold()
             entities: list[EntitySeed] = []
             seen_entities: set[str] = set()
             for entity in sub.key_entities:
                 key = entity.text.strip().casefold()
-                if entity.label in allowed and key and key in context_cf and key not in seen_entities:
+                if (
+                    entity.label in allowed
+                    and key not in seen_entities
+                    and contains_term(context, entity.text)
+                ):
                     entities.append(EntitySeed(text=entity.text.strip(), label=entity.label))
                     seen_entities.add(key)
                 else:
@@ -168,15 +148,10 @@ class AgentNodes:
             )
         return clean
 
-    # ------------------------------------------------------------------ #
-    # Localization Adapter
-    # ------------------------------------------------------------------ #
-
     def localization_adapter(self, state: SampleState) -> dict[str, Any]:
-        """Transcreate the sub-topic into the target language.
+        """Rewrite the sub-topic's passage in the target language.
 
-        On a retry the previous draft and the critic's feedback are appended to
-        the prompt, closing the adversarial loop.
+        On a retry the rejected draft and the critic's feedback go into the prompt.
         """
         task = state["task"]
         lang = get_language(task.language_key)
@@ -234,36 +209,32 @@ class AgentNodes:
 
     @staticmethod
     def _missing_key_entities(task: SampleTask, candidate: LocalizedCandidate) -> list[str]:
-        """Key entities with no aligned counterpart in the candidate.
+        """Key entities that didn't make it into the candidate.
 
-        A key entity counts as preserved if an aligned mention cites it as its
-        ``source_text``, or if its English form appears verbatim in the text
-        (common for Hinglish and for drug names kept in Latin script).
+        An entity counts as kept if an aligned mention names it as source_text,
+        or if the English word itself appears in the text (common in Hinglish,
+        and for drug names left in Latin script).
         """
+        strict = get_language(task.language_key).strict_right_boundary
         unaligned = {surface for surface, _ in candidate.unaligned}
         cited = {
             m.source_text.strip().casefold()
             for m in candidate.mentions
             if m.source_text.strip() and nfc(m.text).strip() not in unaligned
         }
-        text_cf = candidate.text.casefold()
         return [
             e.text
             for e in task.subtopic.key_entities
-            if e.text.casefold() not in cited and e.text.casefold() not in text_cf
+            if e.text.casefold() not in cited
+            and not contains_term(candidate.text, e.text, strict_right_boundary=strict)
         ]
-
-    # ------------------------------------------------------------------ #
-    # Adversarial Evaluator
-    # ------------------------------------------------------------------ #
 
     def adversarial_evaluator(self, state: SampleState) -> dict[str, Any]:
         """Score the candidate.
 
-        Stage 1 (rules, free): script purity, entity alignment, label taxonomy,
-        key-entity coverage, numeric fidelity. Any failure scores 0.0 with
-        precise feedback and skips the LLM call. Stage 2 (LLM critic): rubric
-        scores for semantic drift, hallucination, entity retention and fluency.
+        The cheap rule checks run first (script, spans, labels, key entities,
+        numbers). If any fail, the score is 0.0 and we skip the LLM critic, which
+        saves a call and gives the localizer exact feedback.
         """
         task, candidate = state["task"], state["candidate"]
         lang = get_language(task.language_key)
@@ -364,15 +335,10 @@ class AgentNodes:
             )
         return failures
 
-    # ------------------------------------------------------------------ #
-    # Sinks
-    # ------------------------------------------------------------------ #
-
     def export_sample(self, state: SampleState) -> dict[str, Any]:
-        """Promote an accepted candidate to a strict :class:`SyntheticSample`.
+        """Turn an accepted candidate into a SyntheticSample.
 
-        Strict validation is the last gate: if it fails, the candidate is
-        quarantined instead of crashing the batch.
+        If the strict schema still rejects it, quarantine it rather than crash.
         """
         task, candidate, evaluation = state["task"], state["candidate"], state["evaluation"]
         lang = get_language(task.language_key)
@@ -408,7 +374,7 @@ class AgentNodes:
         return {"verified_samples": [sample]}
 
     def quarantine_sample(self, state: SampleState) -> dict[str, Any]:
-        """Withhold a candidate that exhausted its retries."""
+        """Out of retries: keep the sample for error analysis, don't publish it."""
         task = state["task"]
         logger.warning(
             "Quarantined %s | %s after %d attempts",

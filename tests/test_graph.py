@@ -156,6 +156,7 @@ def test_architect_output_is_sanitised() -> None:
             "key_entities": [
                 EntitySeed(text="paracetamol", label="DRUG"),
                 EntitySeed(text="aspirin", label="DRUG"),  # not in context
+                EntitySeed(text="time", label="FREQUENCY"),  # only inside "times"
                 EntitySeed(text="fever", label="STATUTE"),  # off-taxonomy
             ]
         }
