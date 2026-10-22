@@ -1,4 +1,4 @@
-"""Pydantic v2 schemas: public dataset contracts, LLM I/O contracts, language registry."""
+"""Dataset records, LLM output shapes and the language list."""
 
 from src.schemas.dataset import (
     DOMAIN_ENTITY_LABELS,

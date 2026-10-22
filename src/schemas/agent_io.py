@@ -1,10 +1,9 @@
-"""Structured-output contracts between the agents and the LLMs.
+"""The shapes the LLMs fill in.
 
-These schemas are passed to ``with_structured_output`` and therefore double as
-instructions: every ``Field(description=...)`` is shown to the model. They are
-intentionally *lenient* (labels are normalised, not rejected) because the model
-is fallible; strictness is enforced later by :mod:`src.schemas.dataset` and the
-Evaluator's deterministic checks.
+Careful when editing: the class docstrings and Field descriptions are sent to
+the model as part of the schema, so they act as prompt text. These models are
+forgiving (labels get normalised rather than rejected); the strict checks
+happen later in the evaluator and in dataset.py.
 """
 
 from __future__ import annotations
@@ -13,13 +12,8 @@ from pydantic import BaseModel, Field, field_validator
 
 
 def _normalise_label(value: str) -> str:
-    """``"lab test"`` / ``"Lab-Test"`` -> ``"LAB_TEST"``."""
+    # "lab test" / "Lab-Test" -> "LAB_TEST"
     return "_".join(value.strip().upper().replace("-", " ").split())
-
-
-# --------------------------------------------------------------------------- #
-# Domain Architect
-# --------------------------------------------------------------------------- #
 
 
 class EntitySeed(BaseModel):
@@ -55,11 +49,6 @@ class DomainBlueprint(BaseModel):
     subtopics: list[SubTopic] = Field(description="Distinct, non-overlapping sub-topics.")
 
 
-# --------------------------------------------------------------------------- #
-# Localization Adapter
-# --------------------------------------------------------------------------- #
-
-
 class EntityMention(BaseModel):
     """An entity as it appears in the *localised* passage."""
 
@@ -85,11 +74,6 @@ class LocalizedDraft(BaseModel):
     adaptation_notes: str = Field(
         default="", description="Optional brief notes on non-obvious adaptation choices (English)."
     )
-
-
-# --------------------------------------------------------------------------- #
-# Adversarial Evaluator
-# --------------------------------------------------------------------------- #
 
 
 class CriticVerdict(BaseModel):

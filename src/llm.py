@@ -1,16 +1,9 @@
-"""Provider-agnostic LLM layer.
+"""LLM wrapper used by every agent.
 
-The agents never touch a vendor SDK. They depend on the
-:class:`StructuredGenerator` protocol: "give me an instance of this Pydantic
-schema". :class:`StructuredLLM` implements it on top of any LangChain chat
-model, adding:
-
-* schema-validated outputs via ``with_structured_output(method="json_schema")``
-  (Claude structured outputs / Ollama grammar-constrained decoding);
-* bounded retries with exponential backoff and jitter for transient failures;
-* self-correction: a schema-validation failure is fed back to the model on the
-  next attempt;
-* per-call token/latency telemetry.
+Agents only ask for "an instance of this Pydantic model". StructuredLLM does
+that on top of a LangChain chat model (Claude or Ollama), retries transient
+errors with backoff, shows the model its own validation error when the output
+doesn't fit the schema, and logs tokens and latency for every call.
 """
 
 from __future__ import annotations
@@ -37,16 +30,15 @@ _TRANSIENT_NAME_HINTS = ("timeout", "connect", "ratelimit", "overloaded", "unava
 
 
 class LLMCallError(RuntimeError):
-    """The provider could not produce a response (after retries if transient)."""
+    pass
 
 
 class StructuredOutputError(LLMCallError):
-    """The model kept returning output that does not match the requested schema."""
+    """The model kept returning output that doesn't match the schema."""
 
 
 class StructuredGenerator(Protocol):
-    """What the agents need from an LLM. Implemented by :class:`StructuredLLM`
-    in production and by scripted fakes in tests."""
+    """What the agents need from an LLM. Tests implement this with fakes."""
 
     @property
     def model_label(self) -> str: ...
@@ -55,11 +47,7 @@ class StructuredGenerator(Protocol):
 
 
 def build_chat_model(spec: LLMSpec, settings: Settings) -> BaseChatModel:
-    """Instantiate the LangChain chat model for ``spec``.
-
-    Provider packages are imported lazily so an Ollama-only install does not
-    need Anthropic credentials (and vice versa).
-    """
+    # Imports are local so an Ollama-only setup doesn't need the Anthropic package, and vice versa.
     if spec.provider is Provider.ANTHROPIC:
         from langchain_anthropic import ChatAnthropic
 
@@ -93,11 +81,10 @@ def build_chat_model(spec: LLMSpec, settings: Settings) -> BaseChatModel:
 
 
 def is_transient(exc: BaseException) -> bool:
-    """Heuristically decide whether retrying ``exc`` can succeed.
+    """Best guess at whether retrying could help.
 
-    Uses HTTP status codes where the SDK exposes them and falls back to the
-    exception class name, so it works across provider SDKs without importing
-    them.
+    Checks the HTTP status if the SDK exposes one, otherwise the exception's
+    class name, so we don't have to import every provider's error types.
     """
     if isinstance(exc, (TimeoutError, ConnectionError)):
         return True
@@ -111,8 +98,6 @@ def is_transient(exc: BaseException) -> bool:
 
 
 class StructuredLLM:
-    """A role-bound chat model that returns validated Pydantic objects."""
-
     def __init__(
         self,
         role: AgentRole,
@@ -137,9 +122,8 @@ class StructuredLLM:
 
     def _runnable_for(self, schema: type[BaseModel]) -> Runnable[Any, Any]:
         if schema not in self._runnables:
-            # Native constrained decoding on both backends: Claude structured
-            # outputs (newer Claude models reject forced tool calling) and
-            # Ollama's grammar-based `format`.
+            # json_schema works on both backends: Claude structured outputs
+            # (newer models reject forced tool calls) and Ollama's `format`.
             self._runnables[schema] = self._chat_model.with_structured_output(
                 schema, method="json_schema", include_raw=True
             )
@@ -174,12 +158,11 @@ class StructuredLLM:
         )
 
     def generate(self, schema: type[T], *, system: str, user: str, tag: str = "") -> T:
-        """Return a validated ``schema`` instance.
+        """Call the model until it returns a valid ``schema`` instance.
 
-        Raises:
-            LLMCallError: non-transient provider error, or transient errors
-                persisting past ``max_attempts``.
-            StructuredOutputError: the model never produced schema-valid output.
+        Raises LLMCallError if the provider fails (straight away for permanent
+        errors, after max_attempts for transient ones), or StructuredOutputError
+        if the output never fits the schema.
         """
         messages: list[BaseMessage] = [SystemMessage(system), HumanMessage(user)]
         runnable = self._runnable_for(schema)
@@ -223,7 +206,7 @@ class StructuredLLM:
                 "[%s] schema violation (attempt %d/%d): %s",
                 self.role.value, attempt, self._max_attempts, last_problem[:300],
             )
-            # Self-correction: show the model exactly why its output was rejected.
+            # Tell the model why its output was rejected; it usually fixes it next time.
             messages = [
                 SystemMessage(system),
                 HumanMessage(
@@ -239,7 +222,6 @@ class StructuredLLM:
 
 
 def build_role_llms(settings: Settings, tracker: UsageTracker) -> dict[AgentRole, StructuredLLM]:
-    """Create one :class:`StructuredLLM` per agent role from ``settings``."""
     llms: dict[AgentRole, StructuredLLM] = {}
     for role in AgentRole:
         spec = settings.spec_for(role)

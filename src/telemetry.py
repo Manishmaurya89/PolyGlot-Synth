@@ -1,4 +1,4 @@
-"""Thread-safe token and latency accounting for every LLM call."""
+"""Counts tokens and time for every LLM call. Safe to use from parallel workers."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import pandas as pd
 
 @dataclass(frozen=True, slots=True)
 class LLMCallRecord:
-    """One physical request to a model (retries are recorded individually)."""
+    """One request to a model. Each retry gets its own record."""
 
     role: str
     model: str
@@ -22,8 +22,6 @@ class LLMCallRecord:
 
 
 class UsageTracker:
-    """Collects :class:`LLMCallRecord` objects from concurrent graph branches."""
-
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._records: list[LLMCallRecord] = []
@@ -38,7 +36,6 @@ class UsageTracker:
             return list(self._records)
 
     def totals(self) -> dict[str, float]:
-        """Aggregate counters across all roles."""
         records = self.records
         return {
             "calls": len(records),
@@ -49,7 +46,7 @@ class UsageTracker:
         }
 
     def summary_frame(self) -> pd.DataFrame:
-        """Per role/model usage table (empty frame if nothing was recorded)."""
+        """Usage per role and model. Empty if nothing was recorded."""
         records = self.records
         if not records:
             return pd.DataFrame()

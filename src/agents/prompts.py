@@ -1,11 +1,12 @@
-"""Prompt templates for the three agents.
+"""Prompts for the three agents (filled in with str.format).
 
-Kept separate from node logic so prompts can be versioned and A/B tested
-without touching control flow. Templates use ``str.format`` placeholders.
+Changing wording here changes model behaviour, so re-run a small batch after
+any edit.
 """
 
 from __future__ import annotations
 
+# The architect picks one of these per sub-topic so the dataset isn't all one style.
 TEXT_FORMATS: dict[str, tuple[str, ...]] = {
     "medical": (
         "patient counselling dialogue",
@@ -31,10 +32,6 @@ TEXT_FORMATS: dict[str, tuple[str, ...]] = {
     ),
 }
 
-# --------------------------------------------------------------------------- #
-# Domain Architect
-# --------------------------------------------------------------------------- #
-
 ARCHITECT_SYSTEM = """\
 You are the Domain Architect of a synthetic-data pipeline that builds {domain} NLP datasets \
 for Indian languages. You design the content plan; other agents adapt it into Indian languages.
@@ -52,10 +49,6 @@ exactly one of: {labels}.
 """
 
 ARCHITECT_USER = "Seed topic: {seed_topic}"
-
-# --------------------------------------------------------------------------- #
-# Localization Adapter
-# --------------------------------------------------------------------------- #
 
 LOCALIZER_SYSTEM = """\
 You are a native {language} writer and a {domain} subject-matter expert. You TRANSCREATE \
@@ -105,10 +98,6 @@ Reviewer feedback (fix every point):
 Write a new, corrected version. Do not repeat the rejected wording where it was criticised.
 """
 
-# --------------------------------------------------------------------------- #
-# Adversarial Evaluator
-# --------------------------------------------------------------------------- #
-
 EVALUATOR_SYSTEM = """\
 You are an adversarial quality reviewer for a {domain} NLP dataset, fluent in English and \
 {language}. Assume the candidate contains at least one defect until you have verified \
@@ -153,5 +142,4 @@ Automatic checks: script purity {script_ratio:.2f}, key-entity coverage {coverag
 
 
 def bullet_list(items: list[str]) -> str:
-    """Render ``items`` as a ``- item`` list, or ``- (none)``."""
     return "\n".join(f"- {item}" for item in items) if items else "- (none)"
