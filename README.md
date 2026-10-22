@@ -1,89 +1,69 @@
-# PolyGlot-Crew: Synthetic Multilingual Data & Knowledge Generator
+# PolyGlot-Crew
 
-PolyGlot-Crew is a multi-agent pipeline built on **LangGraph** and **Pydantic v2**. It generates domain-specific NLP datasets (medical, legal, finance) in Indian languages and scripts, then checks every sample before it can be exported:
+Generates synthetic NLP datasets (medical, legal, finance) in Indian languages, and only keeps the samples that pass review.
 
-1. A **Domain Architect** expands a seed topic into sub-topics, each with a factual English source passage.
-2. A **Localization Adapter** rewrites each passage for native readers of Hindi, Hinglish, Telugu, Tamil and other languages, adapting it rather than translating word for word.
-3. An **Adversarial Evaluator** scores each candidate. Low scores go back to the adapter with feedback, up to 3 retries. A sample that still fails is quarantined.
+You give it a seed topic like "Clinical Drug Dosage Diagnostics" and a list of languages. Three LLM agents then do the work:
 
-Only samples that pass every gate become publishable `SyntheticSample` records with character-exact entity spans. These are written as JSONL and can be published directly as a Hugging Face dataset.
+1. **Domain Architect** splits the topic into sub-topics. Each gets a short English source passage and a list of key entities (drug names, doses, statutes, amounts...).
+2. **Localization Adapter** rewrites each passage for native readers of Hindi, Hinglish, Telugu, Tamil and so on. It adapts the text rather than translating word for word.
+3. **Adversarial Evaluator** reviews every draft. A rejected draft goes back to the adapter with feedback, up to 3 times. If it still fails, it's quarantined, not published.
 
-The pipeline is **model-agnostic**: each agent runs on the Claude API or on a local Ollama model (`llama3`, `mistral`, ...), and you can mix them per role.
+What passes ends up as JSONL with exact character spans for every entity, ready for NER training or for publishing on the Hugging Face Hub.
 
----
+It's built on LangGraph and Pydantic v2. Each agent can run on the Claude API or on a local Ollama model, and you can mix the two.
 
-## Architecture
+## How it works
 
 ```mermaid
 flowchart TD
-    IN([seed topic · domain · languages]) --> ARCH[Domain Architect<br/><i>sub-topics + English context + key entities</i>]
-    ARCH -->|"Send() × sub-topic × language<br/>(parallel workers)"| LOC
+    IN([topic, domain, languages]) --> ARCH[Domain Architect]
+    ARCH -->|"one worker per sub-topic × language, in parallel"| LOC
 
-    subgraph WORKER["sample_worker (one per sub-topic × language, error-isolated)"]
-        LOC[Localization Adapter<br/><i>transcreate → NFC → align entity spans</i>] --> EVAL
-        EVAL{Adversarial Evaluator<br/>1 · deterministic gates<br/>2 · LLM critic rubric}
-        EVAL -->|"score ≥ 0.85"| EXP[Export<br/><i>strict SyntheticSample validation</i>]
-        EVAL -->|"score < 0.85 and retry_count < 3<br/>(feedback + previous draft)"| LOC
-        EVAL -->|"retries exhausted"| QUA[Quarantine]
+    subgraph WORKER[sample worker]
+        LOC[Localization Adapter] --> EVAL{Evaluator}
+        EVAL -->|"score ≥ 0.85"| EXP[export]
+        EVAL -->|"too low, retries left"| LOC
+        EVAL -->|"out of retries"| QUA[quarantine]
     end
 
-    EXP --> FIN[Finalize DatasetBatch]
-    QUA --> FIN
-    FIN --> V[(verified/*.jsonl)]
-    FIN --> Q[(quarantine/*.jsonl)]
-    FIN --> M[(manifests/*.json)]
-    V --> HF[HF dataset folder<br/>per-language configs + card] --> HUB[(Hugging Face Hub)]
+    EXP --> OUT[(verified / quarantine / manifest files)]
+    QUA --> OUT
+    OUT -.-> HUB[(Hugging Face Hub)]
 ```
 
-### How each stage works
+Some details worth knowing:
 
-| Stage | What it does | Why it matters |
-|---|---|---|
-| **Domain Architect** | Uses structured output (`DomainBlueprint`) to produce N sub-topics, each in a different document format (dialogue, discharge note, SMS reminder, ...) with 4–8 labelled key entities. The output is then cleaned: key entities missing from the passage, labels outside the taxonomy and duplicate sub-topics are dropped. | Every sample is grounded in an explicit English source passage, so the critic has something to check drift and hallucination against. |
-| **Localization Adapter** | Rewrites the passage for native readers using a per-language style guide (register, code-mixing norms, numerals). It returns entity **strings only**, never character offsets. | LLMs cannot count characters. Offsets are computed afterwards by code. |
-| **Span alignment** (`src/linguistics.py`) | Normalizes text to NFC and finds every non-overlapping occurrence of each entity, longest match first, respecting word boundaries. For agglutinative languages (Telugu, Tamil, Kannada, Malayalam) a match may end mid-word so that inflected forms align. | `raw_text[start:end] == text` holds for every published entity. Repeated entities are all labelled, so the data does not teach NER models false negatives. |
-| **Evaluator stage 1: rules** (no tokens spent) | Checks script purity (e.g. ≥ 60% Devanagari for Hindi, ≥ 95% Latin for Hinglish), that every entity occurs verbatim, the label taxonomy, key-entity coverage, and **numeric fidelity**: every number in the source must survive, compared across numeral systems so `२५` = `25`. | Catches the most damaging failures (a changed dose, wrong script, invented spans) without spending tokens. The feedback names the exact problem. |
-| **Evaluator stage 2: LLM critic** | An adversarial rubric (`CriticVerdict`) scores `semantic_fidelity`, `factual_consistency`, `entity_retention` and `fluency`, then gives actionable feedback. | The final score is a weighted mean **capped at the weakest dimension** when that dimension is below `DIMENSION_FLOOR`, so good fluency cannot average away a hallucination. |
-| **Routing** (`route_after_evaluation`) | `score ≥ 0.85` → export. Below that with `retry_count < 3` → back to the adapter with the critic's feedback and the rejected draft. Otherwise → quarantine. | This is the adversarial rejection loop. |
-| **Export** | Builds a strict `SyntheticSample`. If validation fails, the sample is quarantined instead of crashing the run. | Strict schema validation is the last gate before data is published. |
+- **The LLM never gives character offsets.** Models can't count characters reliably, so the adapter returns entity strings only. `src/linguistics.py` then finds every occurrence in the NFC-normalised text and computes the spans, so `raw_text[start:end] == text` always holds. For Telugu, Tamil, Kannada and Malayalam a match may end mid-word, because case suffixes attach directly to the entity.
+- **Cheap checks run before the LLM critic.** The evaluator first checks the script (e.g. at least 60% Devanagari for Hindi), that every tagged entity is really in the text, that the labels are valid, that the key entities survived, and that every number from the source is still there (`२५` counts as `25`). If any of these fail, the draft is rejected with a precise reason and no critic call is spent on it.
+- **The critic's score can't hide a serious error.** It scores semantic fidelity, factual consistency, entity retention and fluency. The final score is a weighted mean, but if any one dimension is below 0.6, the score is capped at that dimension. Great fluency doesn't make up for a changed dose.
+- **One failing sample doesn't sink the batch.** If a provider call fails for one sample, that sample is quarantined with `reason: pipeline_error` and the others carry on.
 
-**Fault isolation.** Each sample runs inside its own exception boundary. A provider outage or repeated schema-invalid output on one sample quarantines that sample (`reason: pipeline_error`), and the rest of the batch continues.
-
----
-
-## Project structure
+## Project layout
 
 ```
-.
-├── main.py                    # CLI: run a batch, print token/perf report, write JSONL, optional Hub push
-├── requirements.txt
-├── .env.example               # all configuration knobs, documented
-├── pytest.ini
-├── scripts/
-│   └── publish_to_hub.py      # publish all verified batches as one HF dataset
-├── src/
-│   ├── config.py              # Settings (validated env config), per-role model routing, QualityGate
-│   ├── llm.py                 # provider factory (Anthropic / Ollama), StructuredLLM: retries + self-correction
-│   ├── telemetry.py           # thread-safe token & latency tracking
-│   ├── linguistics.py         # NFC, script detection, numeral normalization, entity span alignment
-│   ├── graph.py               # LangGraph workflows: fan-out/fan-in + localize⇄evaluate retry loop
-│   ├── exporter.py            # atomic JSONL writer, manifests, HF dataset folder + card, Hub upload
-│   ├── agents/
-│   │   ├── nodes.py           # Domain Architect, Localization Adapter, Adversarial Evaluator, sinks
-│   │   ├── prompts.py         # versionable prompt templates
-│   │   └── state.py           # PipelineState / SampleState TypedDicts + internal models
-│   └── schemas/
-│       ├── dataset.py         # EntityLabel, SyntheticSample, DatasetBatch, QuarantinedSample, taxonomies
-│       ├── agent_io.py        # structured-output contracts for each agent
-│       └── languages.py       # language registry: BCP-47 tag, script, style guide, thresholds
-└── tests/                     # 42 offline tests (scripted LLM fakes): schemas, alignment, graph routing, export
+main.py                  CLI: run a batch, print the report, write the files
+scripts/publish_to_hub.py  publish all verified batches as one HF dataset
+src/
+  config.py              settings from .env, per-role model choice, quality gate
+  llm.py                 Claude/Ollama wrapper: structured output, retries, token logging
+  linguistics.py         NFC, script detection, number matching, entity span alignment
+  graph.py               the two LangGraph graphs (fan-out + retry loop)
+  exporter.py            JSONL/manifest writer, HF dataset folder + card, upload
+  telemetry.py           token and latency counters
+  agents/
+    nodes.py             the three agents and the export/quarantine steps
+    prompts.py           prompt templates
+    state.py             graph state
+  schemas/
+    dataset.py           published record types and entity label sets
+    agent_io.py          what each LLM must return
+    languages.py         supported languages and their style guides
+tests/                   offline tests with a fake LLM
 ```
 
----
+## Setup
 
-## Installation
-
-Requires **Python 3.11+**.
+Needs Python 3.11 or newer.
 
 ```bash
 git clone <your-fork-url> polyglot-crew && cd polyglot-crew
@@ -92,55 +72,48 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
----
-
 ## Running
 
-### Option A: local models with Ollama (free, private)
+### With Ollama (free, runs locally)
 
 ```bash
-# 1. Install Ollama (https://ollama.com) and pull a model
-ollama pull llama3          # or: mistral, qwen2.5, gemma3 ...
-ollama serve                # if it is not already running
+ollama pull llama3     # or mistral, qwen2.5, gemma3...
+ollama serve           # if it isn't running already
 
-# 2. Configure (.env)
+# in .env
 LLM_PROVIDER=ollama
 OLLAMA_MODEL=llama3
-MAX_CONCURRENCY=1           # one local GPU: keep this at 1-2
+MAX_CONCURRENCY=1      # keep it at 1-2 on a single GPU
 
-# 3. Run
 python main.py --seed-topic "Clinical Drug Dosage Diagnostics" --languages hindi hinglish telugu
 ```
 
-> 7–8B local models are weak at Indic generation, and as judges they tend to be lenient. Expect a
-> high quarantine rate and some false accepts. That is the gate doing its job. For better yield,
-> keep generation local but judge with a stronger model (see mixed mode below).
+Small 7–8B models are weak at Indian languages. They often tag words that aren't in their own output, and as judges they tend to be too lenient. Expect a lot of quarantined samples. For a better yield, generate locally and judge with a stronger model (see below).
 
-### Option B: Claude API
+### With the Claude API
 
 ```bash
-# .env
+# in .env
 LLM_PROVIDER=anthropic
 ANTHROPIC_API_KEY=sk-ant-...
-ANTHROPIC_MODEL=claude-sonnet-5-5   # any Claude model id works
+ANTHROPIC_MODEL=claude-sonnet-5-5
 MAX_CONCURRENCY=6
 
 python main.py --domain medical --num-subtopics 5 --languages hindi hinglish telugu tamil
 ```
 
-### Option C: mixed providers per role
+### Mixing models per role
 
-Each agent role can use any `provider:model`, which lets you trade cost against quality. Using a *different* model as the critic also reduces self-preference bias.
+Each role can have its own `provider:model`. Using a different model as the judge also helps against a model going easy on its own writing.
 
 ```bash
-# .env
 LLM_PROVIDER=ollama
 OLLAMA_MODEL=llama3
-EVALUATOR_LLM=anthropic:claude-sonnet-5-5   # generate locally, judge with Claude
+EVALUATOR_LLM=anthropic:claude-sonnet-5-5
 ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-### CLI reference
+### CLI
 
 ```text
 python main.py [--seed-topic TEXT] [--domain {medical,legal,finance}]
@@ -150,13 +123,13 @@ python main.py [--seed-topic TEXT] [--domain {medical,legal,finance}]
                [--push-to-hub [REPO_ID]] [--log-level LEVEL]
 ```
 
-Languages (registry key or BCP-47 code): `hindi` (`hi`), `hinglish` (`hi-Latn`), `marathi`, `bengali`, `gujarati`, `punjabi`, `telugu`, `tamil`, `kannada`, `malayalam`.
+Languages can be given by name or code: `hindi` (`hi`), `hinglish` (`hi-Latn`), `marathi`, `bengali`, `gujarati`, `punjabi`, `telugu`, `tamil`, `kannada`, `malayalam`.
 
-Exit codes: `0` success · `1` configuration/input error · `2` pipeline failure (e.g. provider unreachable) · `130` interrupted.
+Exit codes: 0 success, 1 bad config or input, 2 pipeline failure (e.g. provider unreachable), 130 interrupted.
 
-### Example output
+### What a run looks like
 
-Each LLM call is logged with its tokens and latency, and the run ends with a report. This one comes from a real local run with `llama3`:
+Every LLM call is logged with tokens and time, and you get a report at the end. This is from a real local run with `llama3`:
 
 ```text
 [localizer] ollama:llama3 | hi | Optimizing Antihypertensive Therapy | attempt 1 | 517 in / 296 out tokens | 14.27s
@@ -185,18 +158,18 @@ language  samples  mean_score  min_score  mean_retries  mean_entities
  hi-Latn        1        0.87       0.87           2.0            4.0
 ```
 
-In this run, 10 localizer calls needed only 5 critic calls: the deterministic gates rejected the other 5 drafts for free. One of them was a Hinglish draft that dropped the "3" from "3 times a day".
+The 10 localizer calls needed only 5 critic calls: the rule checks threw out the other 5 drafts before the critic saw them. One was a Hinglish draft that dropped the "3" from "3 times a day".
 
-### Outputs
+### Output files
 
 ```
 data/
-├── verified/<batch_id>.jsonl     # publishable SyntheticSample records
-├── quarantine/<batch_id>.jsonl   # rejected candidates with full feedback history (for error analysis)
-└── manifests/<batch_id>.json     # batch metadata + run report (tokens, latency, acceptance)
+├── verified/<batch_id>.jsonl     samples that passed
+├── quarantine/<batch_id>.jsonl   rejected drafts with all the feedback they got
+└── manifests/<batch_id>.json     batch info + the run report
 ```
 
-A verified record (abridged; this one needed one retry):
+A verified record (shortened; this one needed one retry):
 
 ```json
 {
@@ -222,105 +195,87 @@ A verified record (abridged; this one needed one retry):
 }
 ```
 
----
+## Data format
 
-## Data schemas (`src/schemas/dataset.py`)
+The record types are in `src/schemas/dataset.py`. They're strict, so a bad record can't be created in the first place:
 
-| Model | Fields | Guarantees |
-|---|---|---|
-| `EntityLabel` | `text, label, start_char, end_char` | `end > start`, `end − start == len(text)`, label is `UPPER_SNAKE` |
-| `SyntheticSample` | `id, target_language, script, raw_text, entities, domain, quality_score, feedback` (+ `quality_breakdown`, `provenance`) | `raw_text` is NFC; every span matches `raw_text` exactly; spans sorted and non-overlapping; labels belong to the domain taxonomy; score ∈ [0, 1] |
-| `DatasetBatch` | `batch_id, timestamp, total_samples, samples` (+ `seed_topic`, `domain`) | `total_samples == len(samples)`; unique ids; timezone-aware timestamp |
-| `QuarantinedSample` | task info, `reason`, last draft, `feedback_history`, `error` | Lenient on purpose, so that every failure can still be recorded |
+- `EntityLabel`: `text`, `label`, `start_char`, `end_char`. The span length must equal `len(text)`.
+- `SyntheticSample`: the published record. `raw_text` must be NFC, every span must match the text exactly, spans can't overlap, and labels must belong to the domain.
+- `DatasetBatch`: one run's samples. `total_samples` must match, and ids must be unique.
+- `QuarantinedSample`: a rejected draft. Loosely typed so it can always be saved.
 
-Entity taxonomies: **medical** `DRUG, DOSAGE, FREQUENCY, ROUTE, DURATION, CONDITION, SYMPTOM, LAB_TEST, BODY_PART, PROCEDURE, POPULATION` · **legal** `STATUTE, PROVISION, COURT, PARTY, LEGAL_ROLE, JURISDICTION, DATE, PENALTY, LEGAL_CONCEPT, CASE_REFERENCE, AUTHORITY` · **finance** `ORGANIZATION, FINANCIAL_INSTRUMENT, MONETARY_AMOUNT, PERCENTAGE, DATE, REGULATOR, FINANCIAL_METRIC, TAX_CONCEPT, ACCOUNT_TYPE, MARKET_INDEX`.
+Entity labels per domain:
 
----
+- **medical**: DRUG, DOSAGE, FREQUENCY, ROUTE, DURATION, CONDITION, SYMPTOM, LAB_TEST, BODY_PART, PROCEDURE, POPULATION
+- **legal**: STATUTE, PROVISION, COURT, PARTY, LEGAL_ROLE, JURISDICTION, DATE, PENALTY, LEGAL_CONCEPT, CASE_REFERENCE, AUTHORITY
+- **finance**: ORGANIZATION, FINANCIAL_INSTRUMENT, MONETARY_AMOUNT, PERCENTAGE, DATE, REGULATOR, FINANCIAL_METRIC, TAX_CONCEPT, ACCOUNT_TYPE, MARKET_INDEX
 
 ## Publishing to Hugging Face
 
-1. Create a **write** token at <https://huggingface.co/settings/tokens> and set `HF_TOKEN` in `.env` (or run `hf auth login`).
-2. Publish, using either option:
+1. Create a write token at <https://huggingface.co/settings/tokens> and put it in `.env` as `HF_TOKEN`, or run `hf auth login`.
+2. Publish straight after a run, or later:
 
 ```bash
-# Right after a run
 python main.py --push-to-hub your-username/polyglot-medical-indic
 
-# Or later: merge every batch in data/verified/ into one dataset
+# merge every batch in data/verified/ into one dataset
 python scripts/publish_to_hub.py --repo-id your-username/polyglot-medical-indic
-python scripts/publish_to_hub.py --dry-run        # build data/hf_dataset/ locally and inspect it first
+python scripts/publish_to_hub.py --dry-run    # just build data/hf_dataset/ so you can look at it first
 ```
 
-The publisher re-validates every record, removes duplicate ids, and uploads this layout:
+Every record is validated again before upload and duplicate ids are dropped. The upload looks like this:
 
 ```
 hf_dataset/
-├── README.md                 # dataset card: YAML metadata, per-language configs, stats, limitations
-└── data/<lang>/train.jsonl   # e.g. data/hi/, data/hi-Latn/, data/te/
+├── README.md                 dataset card (metadata, one config per language, stats, limitations)
+└── data/<lang>/train.jsonl   e.g. data/hi/, data/hi-Latn/, data/te/
 ```
 
-Each publish is a **full snapshot**, so stale files on the Hub are removed. Repos are private unless `HF_PRIVATE=false` or `--public` is set. Consumers can then load the data with:
+Each publish replaces what's on the Hub, so old files get removed. Repos are private unless you set `HF_PRIVATE=false` or pass `--public`. Loading the data:
 
 ```python
 from datasets import load_dataset
 
-ds = load_dataset("your-username/polyglot-medical-indic", "all")    # every language
-te = load_dataset("your-username/polyglot-medical-indic", "te")     # one language
+ds = load_dataset("your-username/polyglot-medical-indic", "all")   # every language
+te = load_dataset("your-username/polyglot-medical-indic", "te")    # just Telugu
 ```
-
----
 
 ## Configuration
 
-Every option lives in `.env.example`. These are the main ones:
+All the options are in `.env.example` with comments. The ones you're most likely to change:
 
-| Variable | Default | Purpose |
+| Variable | Default | What it does |
 |---|---|---|
-| `LLM_PROVIDER` | `ollama` | Default backend for all agents (`ollama` or `anthropic`) |
-| `ANTHROPIC_MODEL` / `OLLAMA_MODEL` | `claude-sonnet-5-5` / `llama3` | Model per provider |
-| `ARCHITECT_LLM`, `LOCALIZER_LLM`, `EVALUATOR_LLM` | unset | Per-role `provider:model` override |
-| `*_TEMPERATURE` | 0.7 / 0.6 / 0.0 | Per-role sampling; empty = provider default |
-| `QUALITY_THRESHOLD` | `0.85` | Export threshold |
-| `MAX_RETRIES` | `3` | Feedback rounds before quarantine |
-| `DIMENSION_FLOOR` | `0.6` | Non-compensatory cap on the weakest rubric dimension |
-| `MIN_ENTITY_COVERAGE` | `0.6` | Required share of key entities preserved |
-| `LLM_MAX_ATTEMPTS` | `3` | Per-call retries (transient errors / schema-invalid output, with self-correction) |
-| `MAX_CONCURRENCY` | `2` | Parallel sample workers |
-| `OLLAMA_NUM_CTX` | `8192` | Context window requested from Ollama |
+| `LLM_PROVIDER` | `ollama` | Default backend for every agent (`ollama` or `anthropic`) |
+| `ANTHROPIC_MODEL` / `OLLAMA_MODEL` | `claude-sonnet-5-5` / `llama3` | Model for each provider |
+| `ARCHITECT_LLM`, `LOCALIZER_LLM`, `EVALUATOR_LLM` | empty | Use a different `provider:model` for one role |
+| `*_TEMPERATURE` | 0.7 / 0.6 / 0.0 | Temperature per role; empty means the provider default |
+| `QUALITY_THRESHOLD` | `0.85` | Minimum score to publish |
+| `MAX_RETRIES` | `3` | Fix attempts before a sample is quarantined |
+| `DIMENSION_FLOOR` | `0.6` | Any rubric score below this caps the final score |
+| `MIN_ENTITY_COVERAGE` | `0.6` | Share of key entities that must survive |
+| `LLM_MAX_ATTEMPTS` | `3` | Tries per LLM call (network errors, invalid output) |
+| `MAX_CONCURRENCY` | `2` | Samples processed in parallel |
+| `OLLAMA_NUM_CTX` | `8192` | Context window to ask Ollama for |
 
-Configuration is validated at startup. For example, an `anthropic` role without `ANTHROPIC_API_KEY`, or a malformed `EVALUATOR_LLM`, exits immediately with a clear message.
+Settings are checked at startup. A missing `ANTHROPIC_API_KEY` or a malformed `EVALUATOR_LLM`, for example, stops the run right away with a clear message.
 
----
-
-## Testing
+## Tests
 
 ```bash
 pytest -q
 ```
 
-The suite runs fully offline. The agents depend only on a `StructuredGenerator` protocol, so the tests replace the LLMs with scripted fakes and run the real LangGraph workflow. They cover:
+All 45 tests run offline. The agents only depend on the small `StructuredGenerator` interface, so the tests plug in a fake LLM with scripted answers and run the real LangGraph graph. They cover the schema rules, span alignment (NFC, repeats, nested entities, suffixes, word boundaries), number matching, the export / retry / quarantine paths, rule checks that skip the critic, error isolation, fan-out, and the JSONL and Hugging Face export.
 
-- schema guarantees
-- Unicode alignment edge cases (NFC, repeated and nested entities, agglutinative suffixes, word boundaries)
-- numeral normalization
-- export on a high score, the feedback loop on a low score, and quarantine after `MAX_RETRIES`
-- deterministic rejections that skip the critic call
-- per-sample error isolation
-- full fan-out coverage
-- JSONL / Hugging Face export
+## Extending it
 
----
+- **New language:** add a `LanguageSpec` in `src/schemas/languages.py` (code, script, style guide, `min_script_ratio`, `strict_right_boundary`). If it uses a script we don't have yet, add its Unicode range to `SCRIPT_RANGES` in `src/linguistics.py`.
+- **New domain:** add it to `Domain`, give it labels in `DOMAIN_ENTITY_LABELS`, and add document formats to `TEXT_FORMATS` in `src/agents/prompts.py`.
+- **New provider:** add a branch to `build_chat_model` in `src/llm.py`. Any LangChain chat model with `with_structured_output` should work.
 
-## Extending
+## Limitations
 
-- **New language.** Add a `LanguageSpec` to `src/schemas/languages.py`, with BCP-47 tag, script, style guide, `min_script_ratio` and `strict_right_boundary`. If the script is new, add its Unicode range to `SCRIPT_RANGES` in `src/linguistics.py`.
-- **New domain.** Add a `Domain` member, its label set in `DOMAIN_ENTITY_LABELS`, and its text formats in `prompts.TEXT_FORMATS`.
-- **New provider.** Add a branch to `build_chat_model` in `src/llm.py`. Any LangChain chat model that supports `with_structured_output` works.
-
----
-
-## Limitations & responsible use
-
-- This is **synthetic** data. The checks reduce errors but cannot remove them, and an LLM critic is only as good as its model. Audit a sample by hand, and validate on human-annotated data before relying on models trained with it.
-- Medical, legal and financial content produced here is **not professional advice**. The generated dataset card states this.
-- Entity spans are exact with respect to the text. Label *correctness* comes from the model, though the critic and the rules check it.
+- This is synthetic data. The checks catch a lot, but not everything, and the LLM critic is only as good as the model behind it. Read through a sample of the output yourself, and test anything you train on it against human-labelled data.
+- The medical, legal and financial content isn't professional advice. The generated dataset card says so too.
+- Entity spans are always exact, but whether the label is right is still the model's call. The rules and the critic check it, but they can miss things.

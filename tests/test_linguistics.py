@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.linguistics import align_entities, nfc, script_ratio
+from src.linguistics import align_entities, contains_term, nfc, script_ratio
 from src.schemas.dataset import Script
 from tests.fakes import HINDI_TEXT
 
@@ -53,6 +53,26 @@ def test_matches_must_respect_word_boundaries() -> None:
     result = align_entities("Dose is 5 mgmt units", [("mg", "DOSAGE")])
     assert not result.entities
     assert result.unaligned == [("mg", "DOSAGE")]
+
+
+def test_unit_written_against_a_number_still_aligns() -> None:
+    # Real llama3 output: "120-180mg" was rejected as "not verbatim".
+    text = "dosage 120-180mg hai, 24 ghante mein 1g se zyada nahi"
+    result = align_entities(text, [("mg", "DOSAGE"), ("g", "DOSAGE")])
+    assert not result.unaligned
+    assert [e.text for e in result.entities] == ["mg", "g"]
+
+
+def test_number_inside_a_longer_number_does_not_align() -> None:
+    result = align_entities("Take 1500 mg daily", [("500", "DOSAGE")])
+    assert result.unaligned == [("500", "DOSAGE")]
+
+
+def test_contains_term_matches_whole_words_only() -> None:
+    assert contains_term("Give IV fluids", "iv")
+    assert not contains_term("The test came back positive", "IV")
+    assert not contains_term("three times a day", "time")
+    assert contains_term("take 500mg now", "mg")
 
 
 def test_agglutinative_suffix_allowed_only_when_configured() -> None:

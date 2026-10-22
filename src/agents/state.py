@@ -1,13 +1,8 @@
-"""Graph state definitions and the pipeline-internal models they carry.
+"""Graph state, plus the small models passed between nodes.
 
-Two state schemas exist because the workflow has two levels:
-
-* :class:`PipelineState` - one per run: seed topic -> blueprint -> batch.
-* :class:`SampleState` - one per (sub-topic x language) work item, owning the
-  localize -> evaluate -> retry loop. Many run in parallel.
-
-List fields use ``operator.add`` reducers so parallel branches append rather
-than overwrite each other.
+PipelineState belongs to the outer graph (one per run), SampleState to each
+parallel worker. The list fields use operator.add so that parallel workers
+append to them instead of overwriting each other.
 """
 
 from __future__ import annotations
@@ -28,13 +23,9 @@ from src.schemas.dataset import (
     SyntheticSample,
 )
 
-# --------------------------------------------------------------------------- #
-# Internal models
-# --------------------------------------------------------------------------- #
-
 
 class SampleTask(BaseModel):
-    """An immutable unit of work: adapt one sub-topic into one language."""
+    """One unit of work: adapt one sub-topic into one language."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -46,38 +37,25 @@ class SampleTask(BaseModel):
 
 
 class LocalizedCandidate(BaseModel):
-    """A localizer draft after deterministic post-processing (NFC + alignment)."""
+    """A localizer draft after NFC normalisation and span alignment."""
 
     text: str
-    entities: list[EntityLabel]
-    """Aligned spans, ready for :class:`SyntheticSample`."""
-    mentions: list[EntityMention]
-    """Raw mentions as returned by the model (kept for coverage and debugging)."""
+    entities: list[EntityLabel]  # aligned spans, ready for SyntheticSample
+    mentions: list[EntityMention]  # raw model output, used for coverage checks
     unaligned: list[tuple[str, str]] = Field(default_factory=list)
     invalid_labels: list[str] = Field(default_factory=list)
     adaptation_notes: str = ""
 
 
 class Evaluation(BaseModel):
-    """The Evaluator's verdict on one candidate."""
-
     score: float = Field(ge=0.0, le=1.0)
-    breakdown: QualityBreakdown | None = None
-    """``None`` when deterministic checks failed and the LLM critic was skipped."""
+    breakdown: QualityBreakdown | None = None  # None if the rule checks failed (critic skipped)
     feedback: str
     issues: list[str] = Field(default_factory=list)
-    judged_by: str
-    """``"rules"`` or the critic's ``provider:model`` label."""
-
-
-# --------------------------------------------------------------------------- #
-# Graph states
-# --------------------------------------------------------------------------- #
+    judged_by: str  # "rules" or the critic's provider:model
 
 
 class PipelineState(TypedDict, total=False):
-    """Top-level graph state."""
-
     seed_topic: str
     domain: Domain
     language_keys: list[str]
@@ -89,17 +67,14 @@ class PipelineState(TypedDict, total=False):
 
 
 class WorkerInput(TypedDict):
-    """Payload delivered to each parallel sample worker via ``Send``."""
+    """What each Send() hands to a sample worker."""
 
     task: SampleTask
 
 
 class SampleState(TypedDict, total=False):
-    """Per-sample loop state (localize -> evaluate -> route)."""
-
     task: SampleTask
-    attempts: int
-    """Number of localization attempts so far; ``retry_count = attempts - 1``."""
+    attempts: int  # localizer attempts so far, so retries = attempts - 1
     candidate: LocalizedCandidate
     evaluation: Evaluation
     feedback_history: Annotated[list[str], operator.add]

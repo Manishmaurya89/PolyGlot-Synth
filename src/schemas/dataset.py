@@ -1,18 +1,11 @@
-"""Public dataset contracts for PolyGlot-Crew.
+"""The records we publish, and the rules they must pass.
 
-Every record that leaves the pipeline is validated against one of these models.
-They are deliberately strict:
+These are strict on purpose: a sample with a span that doesn't match its text,
+an unknown label, or text that isn't NFC simply can't be built. (NFC matters
+because Indic scripts can encode the same character in more than one way, which
+throws character offsets off.)
 
-* ``EntityLabel`` spans must be internally consistent (``end - start == len(text)``).
-* ``SyntheticSample`` re-checks every span against ``raw_text``, rejects
-  overlapping spans, enforces the domain label taxonomy and requires the text to
-  be Unicode NFC-normalised (Indic scripts have several byte-level encodings for
-  the same grapheme, and un-normalised text silently breaks character offsets).
-* ``DatasetBatch`` guarantees ``total_samples`` matches the payload and that
-  sample ids are unique.
-
-LLM-facing (lenient) schemas live in :mod:`src.schemas.agent_io`; this module
-only describes what is allowed into the published dataset.
+The looser models the LLMs fill in are in agent_io.py.
 """
 
 from __future__ import annotations
@@ -33,22 +26,15 @@ from pydantic import (
     model_validator,
 )
 
-# --------------------------------------------------------------------------- #
-# Enumerations & taxonomies
-# --------------------------------------------------------------------------- #
-
 
 class Domain(StrEnum):
-    """Supported knowledge domains."""
-
+    # A new domain also needs labels in DOMAIN_ENTITY_LABELS and formats in prompts.TEXT_FORMATS.
     MEDICAL = "medical"
     LEGAL = "legal"
     FINANCE = "finance"
 
 
-class Script(StrEnum):
-    """Writing systems, identified by their ISO 15924 code."""
-
+class Script(StrEnum):  # ISO 15924 codes
     DEVANAGARI = "Deva"
     LATIN = "Latn"
     BENGALI = "Beng"
@@ -61,13 +47,12 @@ class Script(StrEnum):
 
 
 class QuarantineReason(StrEnum):
-    """Why a sample was withheld from the published dataset."""
-
-    LOW_QUALITY = "low_quality"  # retries exhausted below the quality threshold
-    SCHEMA_VIOLATION = "schema_violation"  # passed QA but failed strict validation
+    LOW_QUALITY = "low_quality"  # still below the threshold after the last retry
+    SCHEMA_VIOLATION = "schema_violation"  # passed review but failed strict validation
     PIPELINE_ERROR = "pipeline_error"  # an LLM/provider error aborted the sample
 
 
+# The only labels allowed per domain; anything else is rejected at export.
 DOMAIN_ENTITY_LABELS: Mapping[Domain, frozenset[str]] = {
     Domain.MEDICAL: frozenset(
         {
@@ -114,7 +99,6 @@ DOMAIN_ENTITY_LABELS: Mapping[Domain, frozenset[str]] = {
         }
     ),
 }
-"""Closed label set per domain. Anything outside it is rejected at export time."""
 
 UnitInterval = Annotated[float, Field(ge=0.0, le=1.0)]
 
@@ -129,17 +113,9 @@ def _require_nfc(value: str) -> str:
     return value
 
 
-# --------------------------------------------------------------------------- #
-# Core records
-# --------------------------------------------------------------------------- #
-
-
 class EntityLabel(BaseModel):
-    """A labelled character span inside ``SyntheticSample.raw_text``.
-
-    Offsets are Python ``str`` indices (Unicode code points, end-exclusive) into
-    the NFC-normalised text, so ``raw_text[start_char:end_char] == text``.
-    """
+    """A labelled span. Offsets are Python string indices, end-exclusive, so
+    ``raw_text[start_char:end_char] == text``."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -174,7 +150,7 @@ class QualityBreakdown(BaseModel):
 
 
 class Provenance(BaseModel):
-    """Lineage metadata: where a sample came from and how it was produced."""
+    """Where a sample came from and which models made it."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -189,7 +165,7 @@ class Provenance(BaseModel):
 
 
 class SyntheticSample(BaseModel):
-    """A verified, publishable sample. Construction fails on any inconsistency."""
+    """A sample that passed review. Building one fails if anything is inconsistent."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -231,8 +207,8 @@ class SyntheticSample(BaseModel):
 
 
 class QuarantinedSample(BaseModel):
-    """A rejected candidate kept for error analysis. Intentionally lenient:
-    whatever made the sample fail must still be recordable."""
+    """A rejected sample, kept for error analysis. Loosely typed so that we can
+    record it whatever went wrong."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -254,7 +230,7 @@ class QuarantinedSample(BaseModel):
 
 
 class DatasetBatch(BaseModel):
-    """A self-describing collection of verified samples from one pipeline run."""
+    """All verified samples from one run."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -278,5 +254,4 @@ class DatasetBatch(BaseModel):
 
     @classmethod
     def from_samples(cls, samples: Sequence[SyntheticSample], **fields: Any) -> DatasetBatch:
-        """Build a batch, deriving ``total_samples`` from ``samples``."""
         return cls(samples=list(samples), total_samples=len(samples), **fields)

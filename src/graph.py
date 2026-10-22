@@ -1,20 +1,16 @@
-"""LangGraph workflow definition.
+"""The LangGraph workflows.
 
-Two compiled graphs cooperate:
+There are two graphs. The outer one runs once per batch:
 
-``polyglot_crew`` (one invocation per run)::
+    domain_architect --Send per (sub-topic, language)--> sample_worker --> finalize_batch
 
-    START -> domain_architect ==Send(sub-topic x language)==> sample_worker -> finalize_batch -> END
+Each sample_worker runs the inner graph, which loops until the sample passes
+or runs out of retries:
 
-``sample_worker`` (one invocation per work item, many in parallel)::
+    localization_adapter -> adversarial_evaluator -> export | retry | quarantine
 
-    START -> localization_adapter -> adversarial_evaluator -> route_after_evaluation
-                  ^                                              |  score >= threshold  -> export     -> END
-                  +---------- "retry" (feedback) ----------------|  score <  threshold, retries left
-                                                                 |  retries exhausted   -> quarantine -> END
-
-Each work item runs inside an exception boundary, so a provider outage on one
-sample quarantines that sample instead of aborting the batch.
+A worker that throws (e.g. Ollama goes down) only quarantines its own sample;
+the rest of the batch carries on.
 """
 
 from __future__ import annotations
@@ -50,12 +46,8 @@ Route = Literal["export", "retry", "quarantine"]
 
 
 def route_after_evaluation(state: SampleState, gate: QualityGate) -> Route:
-    """Conditional edge after the Evaluator.
-
-    * ``score >= threshold``                  -> ``export``
-    * ``score <  threshold`` and retries left -> ``retry`` (back to the localizer)
-    * otherwise                               -> ``quarantine``
-    """
+    """Export if the score clears the threshold, retry while retries are left,
+    otherwise quarantine."""
     evaluation = state["evaluation"]
     retry_count = state.get("attempts", 1) - 1
     if evaluation.score >= gate.threshold:
@@ -66,8 +58,6 @@ def route_after_evaluation(state: SampleState, gate: QualityGate) -> Route:
 
 
 def build_sample_graph(nodes: AgentNodes, gate: QualityGate) -> CompiledStateGraph:
-    """Compile the per-sample localize -> evaluate -> route loop."""
-
     def router(state: SampleState) -> Route:
         return route_after_evaluation(state, gate)
 
@@ -90,7 +80,7 @@ def build_sample_graph(nodes: AgentNodes, gate: QualityGate) -> CompiledStateGra
 
 
 def finalize_batch(state: PipelineState) -> dict[str, Any]:
-    """Assemble verified samples (deterministically ordered) into a batch."""
+    # Workers finish in any order; sort so the output file is stable between runs.
     samples = sorted(
         state.get("verified_samples", []),
         key=lambda s: (s.target_language, s.provenance.subtopic if s.provenance else "", s.id),
@@ -102,17 +92,15 @@ def finalize_batch(state: PipelineState) -> dict[str, Any]:
 
 
 def build_pipeline_graph(nodes: AgentNodes, gate: QualityGate) -> CompiledStateGraph:
-    """Compile the top-level fan-out / fan-in graph."""
     sample_graph = build_sample_graph(nodes, gate)
     # Two steps per attempt plus the sink, with headroom.
     sample_config = {"recursion_limit": 2 * (gate.max_retries + 1) + 10}
 
     def sample_worker(payload: WorkerInput) -> dict[str, Any]:
-        """Run one work item through the sample graph inside an error boundary."""
         task = payload["task"]
         try:
             final: SampleState = sample_graph.invoke({"task": task, "attempts": 0}, sample_config)
-        except Exception as exc:  # isolate per-sample failures from the batch
+        except Exception as exc:  # one bad sample shouldn't kill the batch
             logger.error(
                 "Sample %s (%s | %s) aborted: %s",
                 task.task_id, task.language_key, task.subtopic.title[:40], exc,
@@ -127,7 +115,6 @@ def build_pipeline_graph(nodes: AgentNodes, gate: QualityGate) -> CompiledStateG
         }
 
     def fan_out(state: PipelineState) -> list[Send]:
-        """Map step: one ``Send`` per (sub-topic x language) pair."""
         return [
             Send(
                 "sample_worker",
@@ -157,7 +144,6 @@ def build_pipeline_graph(nodes: AgentNodes, gate: QualityGate) -> CompiledStateG
 
 
 def build_pipeline(settings: Settings, tracker: UsageTracker) -> CompiledStateGraph:
-    """Wire provider-backed agents into the compiled pipeline graph."""
     llms = build_role_llms(settings, tracker)
     nodes = AgentNodes(
         architect=llms[AgentRole.ARCHITECT],
@@ -174,11 +160,7 @@ def initial_state(
     languages: Iterable[str],
     num_subtopics: int,
 ) -> PipelineState:
-    """Validate run inputs and build the graph's input state.
-
-    Raises:
-        ValueError: on an empty topic, unknown domain/language or bad count.
-    """
+    """Check the run inputs and build the starting state. Raises ValueError on bad input."""
     if not seed_topic.strip():
         raise ValueError("seed_topic must not be empty")
     if num_subtopics < 1:

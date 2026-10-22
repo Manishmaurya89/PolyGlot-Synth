@@ -1,7 +1,7 @@
-"""Runtime configuration, loaded from environment variables (and ``.env``).
+"""Settings, read from environment variables and .env.
 
-All knobs are validated once at startup so a typo in ``.env`` fails fast with a
-readable message instead of surfacing mid-run as a provider error.
+Everything is validated at startup, so a typo in .env fails right away instead
+of halfway through a run.
 """
 
 from __future__ import annotations
@@ -17,18 +17,16 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, m
 
 
 class ConfigError(ValueError):
-    """Raised when configuration is missing or invalid."""
+    pass
 
 
 class Provider(StrEnum):
-    """Supported LLM backends."""
-
     ANTHROPIC = "anthropic"
     OLLAMA = "ollama"
 
 
 class AgentRole(StrEnum):
-    """The three LLM-backed agents. Each can run on its own provider/model."""
+    """Each role can use its own provider and model."""
 
     ARCHITECT = "architect"
     LOCALIZER = "localizer"
@@ -36,7 +34,7 @@ class AgentRole(StrEnum):
 
 
 class LLMSpec(BaseModel):
-    """Fully resolved model choice for one agent role."""
+    """The resolved model choice for one role."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -47,24 +45,20 @@ class LLMSpec(BaseModel):
 
     @property
     def label(self) -> str:
-        """``"provider:model"`` - used in logs and sample provenance."""
         return f"{self.provider}:{self.model}"
 
 
 class QualityGate(BaseModel):
-    """Acceptance policy applied by the Evaluator and the graph router."""
+    """When a sample counts as good enough to publish."""
 
     model_config = ConfigDict(frozen=True)
 
-    threshold: float = Field(default=0.85, ge=0.0, le=1.0)
-    """Minimum ``quality_score`` for a sample to be exported."""
-    max_retries: int = Field(default=3, ge=0)
-    """Re-generation attempts after the first one before quarantine."""
+    threshold: float = Field(default=0.85, ge=0.0, le=1.0)  # min quality_score to export
+    max_retries: int = Field(default=3, ge=0)  # retries after the first attempt
+    # If any rubric score is below this, the final score is capped at it, so a
+    # hallucination can't be averaged away by good fluency.
     dimension_floor: float = Field(default=0.6, ge=0.0, le=1.0)
-    """If any rubric dimension falls below this, the score is capped at that
-    dimension, so a hallucination cannot be averaged away by good fluency."""
-    min_entity_coverage: float = Field(default=0.6, ge=0.0, le=1.0)
-    """Share of the architect's key entities that must survive localisation."""
+    min_entity_coverage: float = Field(default=0.6, ge=0.0, le=1.0)  # share of key entities kept
     weights: Mapping[str, float] = Field(
         default_factory=lambda: {
             "semantic_fidelity": 0.30,
@@ -83,7 +77,7 @@ _DEFAULT_TEMPERATURES: dict[AgentRole, float] = {
 
 
 class Settings(BaseModel):
-    """Application settings. Build with :meth:`from_env`."""
+    """Use Settings.from_env() rather than building this directly."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -93,9 +87,8 @@ class Settings(BaseModel):
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "llama3"
     ollama_num_ctx: int = Field(default=8192, gt=0)
+    # Optional "provider:model" per role, e.g. generate with Ollama, judge with Claude.
     role_overrides: dict[AgentRole, str] = Field(default_factory=dict)
-    """Optional ``"provider:model"`` per role, e.g. evaluate with Claude while
-    generating locally with Ollama."""
     role_temperatures: dict[AgentRole, float | None] = Field(
         default_factory=lambda: dict(_DEFAULT_TEMPERATURES)
     )
@@ -112,7 +105,6 @@ class Settings(BaseModel):
     hf_private: bool = True
 
     def spec_for(self, role: AgentRole) -> LLMSpec:
-        """Resolve the provider/model an agent role should use."""
         override = self.role_overrides.get(role)
         if override:
             provider_name, _, model = override.partition(":")
@@ -145,12 +137,10 @@ class Settings(BaseModel):
 
     @classmethod
     def from_env(cls, env_file: str | os.PathLike[str] | None = None, **overrides: object) -> Settings:
-        """Load settings from the process environment, after reading ``env_file``
-        (default ``.env`` in the working directory) if present. Explicit
-        ``overrides`` (e.g. from CLI flags) win over the environment.
+        """Read settings from the environment (plus ``env_file`` if it exists).
 
-        Raises:
-            ConfigError: on any missing or invalid value.
+        Keyword overrides, e.g. from CLI flags, win over the environment.
+        Raises ConfigError if anything is missing or invalid.
         """
         load_dotenv(env_file or ".env", override=False)
 

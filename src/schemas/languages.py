@@ -1,8 +1,7 @@
-"""Registry of target languages and the linguistic rules attached to each.
+"""Supported languages. To add one, add a LanguageSpec to LANGUAGES below.
 
-Adding a language is a one-entry change here: give it a BCP-47 tag, its script,
-a style guide the Localization Adapter follows, and the script-purity floor the
-Evaluator enforces.
+(A language in a script we don't support yet also needs its Unicode range in
+linguistics.SCRIPT_RANGES.)
 """
 
 from __future__ import annotations
@@ -14,23 +13,16 @@ from src.schemas.dataset import Script
 
 @dataclass(frozen=True, slots=True)
 class LanguageSpec:
-    """Static description of one target language variety."""
-
-    key: str
-    """CLI-friendly identifier, e.g. ``"hinglish"``."""
-    code: str
-    """BCP-47 tag written to ``SyntheticSample.target_language``."""
+    key: str  # what you pass on the CLI, e.g. "hinglish"
+    code: str  # BCP-47 tag stored on each sample, e.g. "hi-Latn"
     name: str
     script: Script
-    style_guide: str
-    """Register / code-mixing guidance injected into the localization prompt."""
+    style_guide: str  # goes into the localizer prompt
+    # Not 1.0 because Indian technical writing keeps some Latin tokens (mg, GST).
     min_script_ratio: float = 0.6
-    """Minimum share of letters that must be in ``script``. Below 1.0 on purpose:
-    Indian technical prose legitimately keeps some Latin tokens (``mg``, ``GST``)."""
+    # False for Telugu/Tamil/Kannada/Malayalam, where suffixes attach to the
+    # entity (పారాసిటమాల్‌ను = paracetamol + accusative), so a span may end mid-word.
     strict_right_boundary: bool = True
-    """``False`` for agglutinative languages, where case suffixes attach directly
-    to an entity (Telugu ``పారాసిటమాల్‌ను`` = paracetamol + accusative), so an entity
-    span may legitimately end mid-word."""
 
 
 _INDIC_COMMON = (
@@ -138,11 +130,7 @@ LANGUAGES: dict[str, LanguageSpec] = {
 
 
 def get_language(key_or_code: str) -> LanguageSpec:
-    """Resolve a language by registry key (``"telugu"``) or BCP-47 code (``"te"``).
-
-    Raises:
-        ValueError: if the language is not registered.
-    """
+    """Look up a language by key ("telugu") or code ("te")."""
     needle = key_or_code.strip().lower()
     for spec in LANGUAGES.values():
         if needle in (spec.key, spec.code.lower()):

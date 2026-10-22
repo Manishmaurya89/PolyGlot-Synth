@@ -1,10 +1,4 @@
-"""PolyGlot-Crew command-line entry point.
-
-Runs one generation batch end to end:
-
-    seed topic -> Domain Architect -> (sub-topic x language) workers in parallel
-    -> Localization Adapter <-> Adversarial Evaluator loop -> verified / quarantined
-    -> JSONL + manifest on disk -> (optional) Hugging Face Hub
+"""Run one batch: generate, review, write the results, optionally push to the Hub.
 
 Examples:
     python main.py
@@ -83,7 +77,7 @@ def build_report(
     wall_time_s: float,
     planned: int,
 ) -> dict[str, Any]:
-    """Machine-readable run statistics (also stored in the manifest)."""
+    """Run stats as a dict. Printed at the end and saved in the manifest."""
     retries = [s.provenance.retry_count for s in batch.samples if s.provenance]
     reasons: dict[str, int] = {}
     for q in quarantined:
@@ -139,7 +133,7 @@ def print_report(
 
 
 def publish(settings: Settings, repo_id: str) -> str:
-    """Build a Hub folder from every verified batch on disk and upload it."""
+    """Upload every verified batch on disk, not just this run's."""
     verified = sorted((settings.output_dir / "verified").glob("*.jsonl"))
     folder = build_hf_dataset(verified, settings.output_dir / "hf_dataset", repo_id=repo_id)
     token = settings.hf_token.get_secret_value() if settings.hf_token else None

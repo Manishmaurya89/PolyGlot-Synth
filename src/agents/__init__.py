@@ -1,1 +1,1 @@
-"""LangGraph agent nodes, prompts and state definitions."""
+"""Graph nodes, prompts and state."""

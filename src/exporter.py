@@ -1,14 +1,7 @@
-"""Storage and publishing.
+"""Writing run outputs to disk and publishing them to the Hugging Face Hub.
 
-* :class:`DatasetExporter` writes a run's outputs atomically:
-  ``verified/<batch_id>.jsonl``, ``quarantine/<batch_id>.jsonl`` and
-  ``manifests/<batch_id>.json``.
-* :func:`build_hf_dataset` merges any number of verified JSONL files into a
-  Hugging Face Hub-ready folder (per-language configs + dataset card).
-* :func:`push_to_hub` uploads that folder as a dataset repository.
-
-JSONL is written as UTF-8 without ASCII escaping, so Indic text stays
-human-readable in the files and in the Hub viewer.
+JSONL is written as plain UTF-8 (no \\u escapes) so the Indic text is readable
+in the files and in the Hub viewer.
 """
 
 from __future__ import annotations
@@ -39,16 +32,11 @@ M = TypeVar("M", bound=BaseModel)
 
 
 class ExportError(RuntimeError):
-    """Raised when outputs cannot be written, read or published."""
-
-
-# --------------------------------------------------------------------------- #
-# JSONL primitives
-# --------------------------------------------------------------------------- #
+    pass
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
-    """Write via a temp file + ``os.replace`` so readers never see partial files."""
+    # Write to a temp file and rename it, so nobody ever reads a half-written file.
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
@@ -61,18 +49,14 @@ def _atomic_write_text(path: Path, content: str) -> None:
 
 
 def write_jsonl(path: Path, records: Iterable[BaseModel]) -> int:
-    """Atomically write one JSON object per line. Returns the record count."""
+    """Write one record per line and return how many were written."""
     lines = [record.model_dump_json() for record in records]
     _atomic_write_text(path, "".join(f"{line}\n" for line in lines))
     return len(lines)
 
 
 def read_jsonl(path: Path, model: type[M]) -> list[M]:
-    """Read and *re-validate* a JSONL file.
-
-    Raises:
-        ExportError: with the file and line number of the first invalid record.
-    """
+    """Load a JSONL file, validating every line. Errors name the file and line."""
     records: list[M] = []
     with path.open(encoding="utf-8") as handle:
         for lineno, line in enumerate(handle, start=1):
@@ -85,11 +69,6 @@ def read_jsonl(path: Path, model: type[M]) -> list[M]:
     return records
 
 
-# --------------------------------------------------------------------------- #
-# Run outputs
-# --------------------------------------------------------------------------- #
-
-
 @dataclass(frozen=True, slots=True)
 class ExportPaths:
     verified: Path
@@ -98,7 +77,7 @@ class ExportPaths:
 
 
 class DatasetExporter:
-    """Persists one pipeline run under ``output_dir``."""
+    """Writes verified/, quarantine/ and manifests/ files for a run."""
 
     def __init__(self, output_dir: Path) -> None:
         self.output_dir = Path(output_dir)
@@ -109,7 +88,6 @@ class DatasetExporter:
         quarantined: Sequence[QuarantinedSample],
         report: dict[str, Any],
     ) -> ExportPaths:
-        """Write verified samples, quarantined samples and a manifest."""
         paths = ExportPaths(
             verified=self.output_dir / "verified" / f"{batch.batch_id}.jsonl",
             quarantine=self.output_dir / "quarantine" / f"{batch.batch_id}.jsonl",
@@ -134,7 +112,6 @@ class DatasetExporter:
 
 
 def samples_frame(samples: Sequence[SyntheticSample]) -> pd.DataFrame:
-    """Flatten samples into a DataFrame for analysis."""
     return pd.DataFrame(
         [
             {
@@ -154,7 +131,7 @@ def samples_frame(samples: Sequence[SyntheticSample]) -> pd.DataFrame:
 
 
 def language_summary(samples: Sequence[SyntheticSample]) -> pd.DataFrame:
-    """Per-language quality statistics (empty frame if there are no samples)."""
+    """Score/retry stats per language. Empty if there are no samples."""
     df = samples_frame(samples)
     if df.empty:
         return df
@@ -170,11 +147,6 @@ def language_summary(samples: Sequence[SyntheticSample]) -> pd.DataFrame:
         .round(3)
         .reset_index()
     )
-
-
-# --------------------------------------------------------------------------- #
-# Hugging Face
-# --------------------------------------------------------------------------- #
 
 
 def _size_category(n: int) -> str:
@@ -282,20 +254,11 @@ def build_hf_dataset(
     license_id: str = "cc-by-4.0",
     repo_id: str = "<username>/<dataset-name>",
 ) -> Path:
-    """Merge verified JSONL files into a Hub-ready dataset folder.
+    """Merge verified JSONL files into a folder ready to upload to the Hub.
 
-    Layout::
-
-        out_dir/
-          README.md                 # dataset card with per-language configs
-          data/<lang>/train.jsonl
-
-    Every record is re-validated against :class:`SyntheticSample` and
-    de-duplicated by ``id``. The folder is rebuilt from scratch, so it is
-    always a full snapshot of the inputs.
-
-    Raises:
-        ExportError: if there are no inputs or a record is invalid.
+    Produces README.md (the dataset card) and data/<lang>/train.jsonl. Records
+    are re-validated and de-duplicated by id. The folder is rebuilt every time,
+    so it always matches the inputs exactly.
     """
     if not jsonl_files:
         raise ExportError("No verified JSONL files to publish")
@@ -321,11 +284,7 @@ def build_hf_dataset(
 
 
 def push_to_hub(folder: Path, repo_id: str, *, token: str | None, private: bool = True) -> str:
-    """Create (if needed) and upload a dataset repository. Returns its URL.
-
-    Raises:
-        ExportError: on authentication or network failure.
-    """
+    """Upload the folder as a dataset repo (created if needed) and return its URL."""
     from huggingface_hub import HfApi
 
     try:
@@ -336,7 +295,7 @@ def push_to_hub(folder: Path, repo_id: str, *, token: str | None, private: bool 
             repo_type="dataset",
             folder_path=str(folder),
             commit_message="Update PolyGlot-Crew synthetic dataset",
-            delete_patterns=["data/**"],  # keep the Hub an exact snapshot of the folder
+            delete_patterns=["data/**"],  # drop files on the Hub that are no longer in the folder
         )
     except Exception as exc:
         raise ExportError(f"Upload to {repo_id} failed: {exc}") from exc

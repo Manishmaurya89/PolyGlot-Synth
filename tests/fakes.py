@@ -1,7 +1,6 @@
-"""Test doubles: a scripted stand-in for the LLM layer plus sample data.
+"""A fake LLM that returns scripted answers, plus some sample data.
 
-The agents only depend on the ``StructuredGenerator`` protocol, so the full
-LangGraph workflow can be exercised offline and deterministically.
+Lets the tests run the real graph without a network or a model.
 """
 
 from __future__ import annotations
@@ -29,9 +28,9 @@ Response = BaseModel | Exception | Callable[[str, str], BaseModel]
 
 
 class ScriptedGenerator:
-    """Returns queued responses per schema; the last response repeats.
+    """Hands out queued responses per schema and repeats the last one.
 
-    A response may be a model, an exception to raise, or ``f(system, user)``.
+    A response can be a model, an exception to raise, or a function f(system, user).
     """
 
     def __init__(self, label: str, script: dict[type[BaseModel], list[Response]]) -> None:
